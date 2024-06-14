@@ -1,4 +1,5 @@
-#!/home/asarnow/local/opt/miniforge3/envs/relion-5.0/bin/python
+#!/usr/bin/env python
+# Above should be the relion-5.0 Python environment.
 import argparse
 import mrcfile
 import numpy as np
