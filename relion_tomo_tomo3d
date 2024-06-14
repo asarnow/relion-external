@@ -1,0 +1,177 @@
+#!/home/asarnow/local/opt/miniforge3/envs/relion-5.0/bin/python
+import argparse
+import mrcfile
+import numpy as np
+import os
+import os.path
+import shutil
+import starfile
+import subprocess
+import sys
+import traceback
+from pathlib import Path
+
+# ~/local/scripts/relion_tomo_tomo3d --o External/job011/ --in_mics ../24feb09a/AlignTiltSeries/job008/aligned_tilt_series.star --j 1  --pipeline_control External/job011/
+
+def main(args):
+    exit_fail = os.path.join(args.o, "RELION_JOB_EXIT_FAILURE")
+    exit_success = os.path.join(args.o, "RELION_JOB_EXIT_SUCCESS")
+    runout = os.path.join(args.o, "run.out")
+    runerr = os.path.join(args.o, "run.err")
+    os.makedirs(os.path.join(args.o, "tomograms"), exist_ok=True)
+    if os.path.exists(exit_fail): os.remove(exit_fail)
+    if os.path.exists(exit_success): os.remove(exit_success)
+    if os.path.exists(runout): os.remove(runout)
+    if os.path.exists(runerr): os.remove(runerr)
+    try:
+        df = starfile.read(args.in_mics)
+        for i, ts in df.iterrows():
+            tn = ts['rlnTomoName']
+            ali = tn + "_ali.mrc"
+            tlt = tn + ".tlt"
+            tomo = os.path.join(args.o, "tomograms", "rec_" + tn + ".mrc")
+            if os.path.exists(tomo):
+                if args.only_do_unfinished:
+                    continue
+
+            tstar = starfile.read(ts['rlnTomoTiltSeriesStarFile'])
+            flat_idx = np.argmin(np.abs(tstar['rlnTomoNominalStageTiltAngle']))
+            #mstar0 = starfile.read(tstar['rlnMicrographMetadata'].iloc[flat_idx])
+            if args.ctf:
+                defocus = (tstar.iloc[flat_idx]['rlnDefocusU'] + tstar.iloc[flat_idx]['rlnDefocusV']) / 2
+                if args.angpix is None:
+                    args.angpix = ts['rlnTomoTiltSeriesPixelSize']
+                cs = ts['rlnSphericalAberration']
+                kv = ts['rlnVoltage']
+                ac = ts['rlnAmplitudeContrast']
+            else:
+                defocus = cs = kv = ac = None
+
+            cmd = tomo3d_args(os.path.join(ts['rlnTomoImportImodDir'], ali),
+                              os.path.join(ts['rlnTomoImportImodDir'], tlt),
+                              tomo, exe=args.exe,
+                              x=args.width, z=args.depth, y=args.height,
+                              threads=args.j, sirt=args.sirt, fake_sirt=args.fake_sirt,
+                              defocus=defocus, psz=args.angpix, cs=cs, kv=kv, ac=ac)
+#            cmd = "bash -c '" + " ".join(cmd) + "'"
+            if args.script:
+                with open(runout, 'a') as f:
+                    f.write(" ".join(cmd) + "\n")
+                    f.write("clip flipyz %s %s\n" % (tomo,tomo))
+            else:
+                run_tomo3d(cmd, runout, runerr)
+                rot_tomo_x(tomo)
+
+            #cp = subprocess.run(cmd, cwd=os.curdir, capture_output=True, shell=True)
+            #with open(runout, 'a') as f:
+            #    if cp.stdout is not None:
+            #        f.write(cp.stdout.decode('utf-8') + "\n")
+            #with open(runerr, 'a') as f:
+            #    if cp.stderr is not None:
+            #        f.write(cp.stderr.decode('utf-8') + "\n")
+    except Exception:
+        with open(runerr, 'a') as f:
+            exc = traceback.format_exc()
+            f.write(exc)
+            print(exc)
+        Path(exit_fail).touch()
+        return 1
+
+    Path(exit_success).touch()
+    return 0
+
+
+def run_tomo3d(cmd, runout, runerr):
+    with open(runout, 'a') as f:
+        f.write(" ".join(cmd) + "\n")
+        p = subprocess.Popen(cmd, cwd=os.curdir, env=os.environ,
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT,
+                             shell=False)
+        while True:
+            output = p.stdout.readline().decode("utf-8")
+            if output == '' and p.poll() is not None:
+                break
+            if output:
+                l = output.rstrip()
+                with open(runout, 'a') as f:
+                    f.write(l + "\n")
+            if p.stderr is not None:
+                error = p.stderr.readline().decode("utf-8")
+                if error:
+                    l = error.rstrip()
+                    with open(runerr, 'a') as f:
+                        f.write(l + "\n")
+    return
+
+
+def tomo3d_args(ali, tlt, tomo, exe="tomo3d",
+                x=0, z=0, y=0,
+                threads=0, sirt=False, fake_sirt=False,
+                defocus=None, psz=None, cs=None, kv=None, ac=0.07):
+    cmd = [exe,
+    "-a", tlt,
+    "-i", ali,
+    "-o", tomo,
+    "-f", ]
+    if x > 0:
+        cmd.append("-x")
+        cmd.append(str(x))
+    if z > 0:
+        cmd.append("-z")
+        cmd.append(str(z))
+    if y > 0:
+        cmd.append("-y")
+        cmd.append("0,%d" % y)
+    if threads > 0:
+        cmd.append("-t")
+        cmd.append(str(threads))
+    if sirt:
+        cmd.append("-S")
+    elif fake_sirt:
+        cmd.append("-F")
+    else:
+        pass
+    if defocus is not None and psz is not None and cs is not None and kv is not None:
+        cmd.append("-D %f,%f,%f,%f,%f" % (defocus, psz, cs, kv, ac))
+    return cmd
+
+
+def rot_tomo_x(tomo, dest=None):
+    if dest is None:
+        dest = tomo
+    with mrcfile.open(tomo, mode='r', permissive=True) as mrc:
+        rot = np.rot90(mrc.data)
+    with mrcfile.new(dest, overwrite=True) as mrc:
+        mrc.set_data(rot)
+
+
+def transpose_tomo(tomo, dest=None):
+    if dest is None:
+        dest = tomo
+    with mrcfile.open(tomo, mode='r', permissive=True) as mrc:
+        transp = np.transpose(mrc.data, axes=[1,0,2])
+    with mrcfile.new(dest, overwrite=True) as mrc:
+        mrc.set_data(transp)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--o", type=str)
+    parser.add_argument("--pipeline_control", type=str)
+    parser.add_argument("--in_mics", type=str)
+    parser.add_argument("--sirt", action="store_true")
+    parser.add_argument("--fake_sirt", action="store_true")
+    parser.add_argument("--swapxy", action="store_true")
+    parser.add_argument("--height", type=int, default=0)
+    parser.add_argument("--width", type=int, default=0)
+    parser.add_argument("--depth", type=int, default=0)
+    parser.add_argument("--bin", type=int)
+    parser.add_argument("--ctf", action="store_true")
+    parser.add_argument("--j", type=int)
+    parser.add_argument("--only_do_unfinished", action="store_true")
+    parser.add_argument("--script", action="store_true")
+    parser.add_argument("--exe", type=str, default="tomo3d")
+    parser.add_argument("--angpix", type=float)
+    sys.exit(main(parser.parse_args()))
+

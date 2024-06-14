@@ -1,0 +1,121 @@
+#!/home/asarnow/local/opt/miniforge3/envs/relion-5.0/bin/python
+import argparse
+import mrcfile
+import numpy as np
+import os
+import os.path
+import shutil
+import starfile
+import subprocess
+import sys
+import traceback
+from pathlib import Path
+
+
+def main(args):
+    exit_fail = os.path.join(args.o, "RELION_JOB_EXIT_FAILURE")
+    exit_success = os.path.join(args.o, "RELION_JOB_EXIT_SUCCESS")
+    runout = os.path.join(args.o, "run.out")
+    runerr = os.path.join(args.o, "run.err")
+    os.makedirs(args.o, exist_ok=True)
+    if os.path.exists(exit_fail): os.remove(exit_fail)
+    if os.path.exists(exit_success): os.remove(exit_success)
+    if os.path.exists(runout): os.remove(runout)
+    if os.path.exists(runerr): os.remove(runerr)
+    try:
+        df = starfile.read(args.in_mics)
+        for i, ts in df.iterrows():
+            tstar = starfile.read(ts['rlnTomoTiltSeriesStarFile'])
+            mstar = starfile.read(tstar['rlnMicrographMetadata'].iloc[0])
+            # binf = int(np.rint(args.bin * ts['rlnMicrographOriginalPixelSize'] / ts['rlnTomoTiltSeriesPixelSize']))
+            micbin = ts['rlnTomoTiltSeriesPixelSize'] / ts['rlnMicrographOriginalPixelSize']
+            movbin = args.bin * micbin
+            if args.x == 0:
+                x = int(np.rint(mstar['general']['rlnImageSizeX'][0] / movbin))
+            else:
+                x = args.x
+            if args.y == 0:
+                y = int(np.rint(mstar['general']['rlnImageSizeY'][0] / movbin))
+            else:
+                y = args.y
+            ax = tstar['rlnTomoNominalTiltAxisAngle'].iloc[0]
+            if ax > 45 and ax < 135:
+                y, x = x, y
+            external = os.path.join(args.o, "external", ts['rlnTomoName'])
+            prepare(ts['rlnTomoName'], os.path.dirname(ts['rlnEtomoDirectiveFile']), external, scale=args.bin, x=x, y=y)
+            run_newstack("newstack.com", cwd=external)
+            ali = os.path.join(external, ts['rlnTomoName'] + "_ali.mrc")
+    except Exception:
+        exc = traceback.format_exc()
+        print(exc)
+        with open(runout, 'a') as f:
+            f.write(exc)
+        Path(exit_fail).touch()
+        return 1
+
+    # df['rlnTomoTiltSeriesPixelSize'] = df['rlnMicrographOriginalPixelSize'] * args.bin
+    df['rlnTomoTiltSeriesPixelSize'] = df['rlnTomoTiltSeriesPixelSize'] * args.bin
+    df['rlnTomoImportImodDir'] = df['rlnTomoName'].apply(lambda x: os.path.join(args.o, "external", x))
+    starfile.write(df, os.path.join(args.o, "aligned_tilt_series.star"))
+
+    Path(exit_success).touch()
+    return 0
+
+
+def prepare(tn, src, dest, scale=8, x=0, y=0):
+    stack = tn + ".mrc"
+    ali = tn + "_ali.mrc"
+    xf = tn + ".xf"
+    tlt = tn + ".tlt"
+    os.makedirs(dest, exist_ok=True)
+    if os.path.exists(os.path.join(dest, stack)):
+        os.remove(os.path.join(dest, stack))
+    os.symlink(os.path.relpath(os.path.join(src, stack), dest), os.path.join(dest, stack))
+    shutil.copy(os.path.join(src, xf), os.path.join(dest, xf))
+    shutil.copy(os.path.join(src, tlt), os.path.join(dest, tlt))
+    newst = os.path.join(dest, "newstack.com")
+    with open(newst, 'w') as f:
+        f.write("$setenv IMOD_OUTPUT_FORMAT MRC\n")
+        f.write("$newstack -StandardInput\n")
+        f.write("AntialiasFilter -1\n")
+        f.write("InputFile\t" + stack + "\n")
+        f.write("OutputFile\t" + ali + "\n")
+        f.write("TransformFile\t" + xf + "\n")
+        f.write("TaperAtFill\t1,1\n")
+        f.write("AdjustOrigin\n")
+        if x > 0 and y > 0:
+            f.write("SizeToOutputInXandY\t" + str(x) + "," + str(y) + "\n")
+        elif x > 0:
+            f.write("SizeToOutputInXandY\t" + str(x) + "," + "\n")
+        else:
+            f.write("SizeToOutputInXandY\t,,\n")
+        f.write("OffsetsInXandY\t0,0\n")
+        f.write("ImagesAreBinned 1\n")
+        f.write("BinByFactor\t" + str(scale) + "\n")
+        f.write("$if (-e ./savework) ./savework\n")
+    return
+
+
+def run_newstack(com, cwd):
+    cp = subprocess.run(["submfg", com], cwd=cwd, capture_output=True)
+    with open(os.path.join(cwd, "../../run.out"), 'a') as f:
+        f.write("submfg " + com + " @ " + cwd + "\n")
+        if cp.stdout is not None:
+            f.write(cp.stdout.decode('utf-8') + "\n")
+    with open(os.path.join(cwd, "../../run.err"), 'a') as f:
+        if cp.stderr is not None:
+            f.write(cp.stderr.decode('utf-8') + "\n")
+    return
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--o", type=str)
+    parser.add_argument("--pipeline_control", type=str)
+    parser.add_argument("--in_mics", type=str)
+    parser.add_argument("--bin", type=int, default=8, help="Bin aligned TS relative to (binned) micrograph pixel size")
+    parser.add_argument("--x", type=int, default=0)
+    parser.add_argument("--y", type=int, default=0)
+    parser.add_argument("--j", type=int, default=1)
+    sys.exit(main(parser.parse_args()))
+
